@@ -1,7 +1,7 @@
 # src/wrappers.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import gymnasium as gym
@@ -13,6 +13,7 @@ from src.safety import SafetyParams, ConformalCalibrator
 class ContextNonstationaryWrapper(gym.Wrapper):
     """
     Applies a Markov context switch once per episode and configures the underlying highway-env.
+
     Stores last_config for downstream wrappers (noise/dropout, logging).
 
     IMPORTANT: attaches ctx_id/ctx_tuple to both reset() AND step() info so step-level
@@ -100,15 +101,14 @@ class SafetyShieldWrapper(gym.Wrapper):
     """
     Wraps an env with an (optional) safety shield.
 
-    IMPORTANT: We deliberately do NOT import a specific 'SafetyShield' class at module import
-    time, because your src/safety.py may use a different class name. Instead, we lazy-import
-    and search for a shield class only when needed.
+    - Lazy-imports a shield class from src/safety.py and supports multiple class names.
+    - Attaches 'shield_used'/'shield_reason' to info.
+    - Defines a clear safety metric:
+        violation := crashed/collision from highway-env info (if provided)
 
-    If --no_mpc and --no_conformal are both True, this wrapper becomes a pass-through that
-    still logs shield_used/shield_reason fields.
-
-    Also defines a clear safety metric:
-      - violation := crashed/collision from highway-env info (if provided)
+    NEW (Adjustment-speed constraint integration):
+    - Supports set_adjustment_risk(risk, unsafe, s_env, s_agent)
+    - If unsafe, tightens epsilon passed to shield (eps_override) when supported.
     """
 
     def __init__(
@@ -126,8 +126,16 @@ class SafetyShieldWrapper(gym.Wrapper):
         self.no_mpc = bool(no_mpc)
         self.no_conformal = bool(no_conformal)
         self.calibrator = calibrator
-
         self.shield = None
+
+        # Adjustment-speed state (set by SB3 callback via env_method)
+        self._adj_risk: float = 0.0
+        self._adj_unsafe: bool = False
+        self._adj_s_env: float = 0.0
+        self._adj_s_agent: float = 0.0
+
+        # How strongly to tighten eps when unsafe (simple default; tune later)
+        self._adj_eps_scale: float = 1.0
 
         # Only try to build a shield if at least one feature is enabled
         if not (self.no_mpc and self.no_conformal):
@@ -139,13 +147,15 @@ class SafetyShieldWrapper(gym.Wrapper):
                 or getattr(safety_mod, "Shield", None)
                 or getattr(safety_mod, "SafetyLayer", None)
                 or getattr(safety_mod, "MPCShield", None)
+                or getattr(safety_mod, "MPCLikeSafetyShield", None)  # <-- correction
             )
 
             if ShieldCls is None:
                 raise ImportError(
-                    "Could not find a shield class in src/safety.py. "
-                    "Tried: SafetyShield, Shield, SafetyLayer, MPCShield. "
-                    "Run: python -c \"import src.safety as s; print([n for n in dir(s) if 'hield' in n.lower()])\" "
+                    "Could not find a shield class in src/safety.py.\n"
+                    "Tried: SafetyShield, Shield, SafetyLayer, MPCShield, MPCLikeSafetyShield.\n"
+                    "Run:\n"
+                    '  python -c "import src.safety as s; print([n for n in dir(s) if \'hield\' in n.lower()])"\n'
                     "and then update SafetyShieldWrapper to use the correct name."
                 )
 
@@ -161,43 +171,127 @@ class SafetyShieldWrapper(gym.Wrapper):
                 # Fallback: try positional args
                 self.shield = ShieldCls(params, action_space_type, no_mpc, no_conformal, calibrator)
 
+    # ---- Adjustment-speed setter (called via VecEnv env_method) ----
+    def set_adjustment_risk(
+        self,
+        *,
+        risk: float,
+        unsafe: bool,
+        s_env: float = 0.0,
+        s_agent: float = 0.0,
+    ) -> None:
+        self._adj_risk = float(risk)
+        self._adj_unsafe = bool(unsafe)
+        self._adj_s_env = float(s_env)
+        self._adj_s_agent = float(s_agent)
+
     def reset(self, **kwargs):
         return self.env.reset(**kwargs)
+
+    def _get_ctx_id_from_env_or_info(self, info: Dict[str, Any]) -> int:
+        # Prefer info (ContextNonstationaryWrapper injects ctx_id each step)
+        if "ctx_id" in info:
+            try:
+                return int(info.get("ctx_id", -1))
+            except Exception:
+                return -1
+        # Fallback: try env attribute (if present)
+        for obj in (self.env, getattr(self.env, "unwrapped", None)):
+            if obj is not None and hasattr(obj, "_ctx_id"):
+                try:
+                    return int(getattr(obj, "_ctx_id"))
+                except Exception:
+                    pass
+        return -1
 
     def step(self, action):
         shield_used = False
         shield_reason = ""
         proposed_action = action
+        shield_meta: Dict[str, Any] = {"shield_used": False, "shield_reason": ""}
 
+        # Compute eps_override if unsafe
+        eps_override: Optional[float] = None
+        if self._adj_unsafe:
+            # More conservative when unsafe. (Interpretation: raise eps threshold.)
+            eps_override = float(self.params.epsilon) + float(self._adj_eps_scale) * float(self._adj_risk)
+
+        # ---- Shield pre-step (may modify action) ----
         if self.shield is not None:
+            # Try calling shield with the most informative signature first.
             try:
-                # shield.filter_action(env, action) -> (safe_action, used, reason)
-                proposed_action, shield_used, shield_reason = self.shield.filter_action(self.env, action)  # type: ignore[attr-defined]
-            except Exception:
+                # Some shields may accept ctx_id and eps_override
+                # We don't have info yet (until env.step), but ctx_id is injected by the context wrapper
+                # *after* env.step; so we get ctx_id by peeking at wrapped env attribute if possible.
+                dummy_info: Dict[str, Any] = {}
+                ctx_id = self._get_ctx_id_from_env_or_info(dummy_info)
+                proposed_action, shield_meta = self.shield.filter_action(  # type: ignore[attr-defined]
+                    self.env, action, ctx_id, eps_override=eps_override
+                )
+            except TypeError:
+                # Backward compatibility: filter_action(env, action, ctx_id) or filter_action(env, action)
                 try:
-                    # shield(action=..., env=...) -> dict with "action"/"shield_used"/"shield_reason"
+                    dummy_info = {}
+                    ctx_id = self._get_ctx_id_from_env_or_info(dummy_info)
+                    proposed_action, shield_meta = self.shield.filter_action(self.env, action, ctx_id)  # type: ignore[attr-defined]
+                except TypeError:
+                    try:
+                        proposed_action, shield_used, shield_reason = self.shield.filter_action(self.env, action)  # type: ignore[attr-defined]
+                        shield_meta = {
+                            "shield_used": bool(shield_used),
+                            "shield_reason": str(shield_reason),
+                        }
+                    except Exception:
+                        shield_meta = {"shield_used": False, "shield_reason": "shield_error_fallback"}
+                        proposed_action = action
+            except Exception:
+                # Last resort: callable shield interface
+                try:
                     out = self.shield(action=action, env=self.env)  # type: ignore[misc]
                     proposed_action = out.get("action", action)
-                    shield_used = bool(out.get("shield_used", False))
-                    shield_reason = str(out.get("shield_reason", ""))
+                    shield_meta = {
+                        "shield_used": bool(out.get("shield_used", False)),
+                        "shield_reason": str(out.get("shield_reason", "")),
+                        "eps": out.get("eps", np.nan),
+                        "inflate": out.get("inflate", np.nan),
+                    }
                 except Exception:
                     proposed_action = action
-                    shield_used = False
-                    shield_reason = "shield_error_fallback"
+                    shield_meta = {"shield_used": False, "shield_reason": "shield_error_fallback"}
 
+        # ---- Environment step ----
         obs, reward, terminated, truncated, info = self.env.step(proposed_action)
-
         info = dict(info) if info is not None else {}
-        info["shield_used"] = bool(shield_used)
-        info["shield_reason"] = shield_reason
+
+        # Now we have ctx_id from info (ContextNonstationaryWrapper adds it)
+        ctx_id = self._get_ctx_id_from_env_or_info(info)
+
+        # If the shield wants ctx_id but we didn't provide it pre-step, some users prefer
+        # a *post-step* diagnostic call. We DO NOT do that here to avoid side effects.
+        # (We keep things simple and safe.)
+
+        # Populate shield logging fields
+        info["shield_used"] = bool(shield_meta.get("shield_used", False))
+        info["shield_reason"] = str(shield_meta.get("shield_reason", ""))
+
+        # Optional fields if the shield provides them
+        if "eps" in shield_meta:
+            info["eps"] = shield_meta.get("eps", info.get("eps", np.nan))
+        if "inflate" in shield_meta:
+            info["inflate"] = shield_meta.get("inflate", info.get("inflate", np.nan))
 
         # --- Define safety violation signal ---
-        # highway-env commonly uses "crashed" (boolean) to indicate a collision.
         crashed = bool(info.get("crashed", False) or info.get("collision", False))
         info["violation"] = crashed
-
-        # Keep near_miss key stable for logging/plots; define later if desired.
         info.setdefault("near_miss", False)
+
+        # --- Attach adjustment-speed diagnostics ---
+        info["adj_risk"] = float(self._adj_risk)
+        info["adj_unsafe"] = bool(self._adj_unsafe)
+        info["adj_s_env"] = float(self._adj_s_env)
+        info["adj_s_agent"] = float(self._adj_s_agent)
+        info["adj_eps_override"] = float(eps_override) if eps_override is not None else np.nan
+        info["ctx_id"] = ctx_id  # ensure consistent even if downstream overwrote
 
         return obs, reward, terminated, truncated, info
 
@@ -206,8 +300,8 @@ class FixedKinematicsObsWrapper(gym.ObservationWrapper):
     """
     Force a fixed (K, F) observation by truncating/padding on the first axis.
 
-    This solves SB3 buffer mismatch when highway-env returns different (N, F)
-    depending on config/context (e.g., merge defaults to 5 vehicles but contexts use 10).
+    This solves SB3 buffer mismatch when highway-env returns different (N, F) depending on
+    config/context (e.g., merge defaults to 5 vehicles but contexts use 10).
     """
 
     def __init__(self, env: gym.Env, K: int = 10):
@@ -223,9 +317,11 @@ class FixedKinematicsObsWrapper(gym.ObservationWrapper):
 
         low = np.full((self.K, self.F), -np.inf, dtype=space.dtype)
         high = np.full((self.K, self.F), np.inf, dtype=space.dtype)
-
         self.observation_space = gym.spaces.Box(
-            low=low, high=high, shape=(self.K, self.F), dtype=space.dtype
+            low=low,
+            high=high,
+            shape=(self.K, self.F),
+            dtype=space.dtype,
         )
 
     def observation(self, observation):
@@ -235,7 +331,6 @@ class FixedKinematicsObsWrapper(gym.ObservationWrapper):
 
         N, F = obs.shape
         out = np.zeros((self.K, F), dtype=np.float32)
-
         ncopy = min(N, self.K)
         out[:ncopy] = obs[:ncopy].astype(np.float32, copy=False)
         return out
