@@ -176,3 +176,6 @@ class MPCLikeSafetyShield:
             "eps": eps,
             "inflate": inflate,
         }
+
+    # at bottom of src/safety.py
+    SafetyShield = MPCLikeSafetyShield
